@@ -32,7 +32,7 @@ static const char *TAG = "hw_test";
 #define I2C_SDA_IO 5
 #define I2C_SCL_IO 6
 #define I2C_DISPLAY_ADDRESS 0x3C
-#define I2C_FREQ_HZ 400000
+#define I2C_FREQ_HZ 100000 // extra noise margin; bus corruption was traced to LED wiring/grounding, not clock speed
 #define I2C_TIMEOUT_MS 1000
 
 static i2c_master_bus_handle_t i2c_bus_handle = NULL;
@@ -142,7 +142,7 @@ static void init_display(u8g2_t *u8g2)
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &i2c_bus_handle));
 
-    u8g2_Setup_ssd1306_i2c_72x40_er_f(u8g2, U8G2_R0, u8x8_byte_i2c_cb, u8x8_gpio_delay_cb);
+    u8g2_Setup_ssd1306_i2c_72x40_er_f(u8g2, U8G2_R2, u8x8_byte_i2c_cb, u8x8_gpio_delay_cb); // R2 = rotated 180deg
     u8g2_InitDisplay(u8g2);
     u8g2_SetPowerSave(u8g2, 0);
     u8g2_SetContrast(u8g2, 255);

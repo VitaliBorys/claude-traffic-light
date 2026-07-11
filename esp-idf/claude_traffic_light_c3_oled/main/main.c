@@ -51,7 +51,7 @@ static const char *TAG = "traffic_light";
 #define I2C_SDA_IO 5
 #define I2C_SCL_IO 6
 #define I2C_DISPLAY_ADDRESS 0x3C
-#define I2C_FREQ_HZ 400000
+#define I2C_FREQ_HZ 100000 // extra noise margin; bus corruption was traced to LED wiring/grounding, not clock speed
 #define I2C_TIMEOUT_MS 1000
 
 static i2c_master_bus_handle_t i2c_bus_handle = NULL;
@@ -107,6 +107,9 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    // Disable modem sleep: periodic radio wake for beacons otherwise seems to
+    // glitch the I2C bus to the OLED (SDA/SCL run right next to the antenna).
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 }
 
 // Waits up to timeout_ms for a WiFi connection (mirrors original 15s wait).
@@ -204,7 +207,7 @@ static void init_display(void)
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &i2c_bus_handle));
 
-    u8g2_Setup_ssd1306_i2c_72x40_er_f(&u8g2, U8G2_R0, u8x8_byte_i2c_cb, u8x8_gpio_delay_cb);
+    u8g2_Setup_ssd1306_i2c_72x40_er_f(&u8g2, U8G2_R2, u8x8_byte_i2c_cb, u8x8_gpio_delay_cb); // R2 = rotated 180deg
     u8g2_InitDisplay(&u8g2);
     u8g2_SetPowerSave(&u8g2, 0);
     u8g2_SetContrast(&u8g2, 255);
@@ -344,7 +347,7 @@ static void poll_proxy(void)
             reset7d = okr7 ? (int)r7 : -1;
             blocked = is_blocked;
             if (blocked || u >= 1.0f || util7d >= 1.0f)   mode = MODE_RED; // solid red for both
-            else if (u >= 0.80f || util7d >= 0.80f)        mode = MODE_YELLOW;
+            else if (u >= 0.75f || util7d >= 0.75f)        mode = MODE_YELLOW;
             else                                           mode = MODE_GREEN;
         }
         ESP_LOGI(TAG, "util_5h=%.2f util_7d=%.2f reset5h=%ds reset7d=%ds -> mode=%d",
