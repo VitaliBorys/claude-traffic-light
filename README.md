@@ -6,8 +6,8 @@ Anthropic sends back, and serves them as JSON. An ESP32-C3 board polls that
 JSON over WiFi and drives 3 LEDs + a tiny OLED to show how close you are to
 your 5-hour and 7-day usage limits.
 
-- 🟢 green — under 80% on both windows
-- 🟡 yellow — either window ≥ 80%
+- 🟢 green — under 75% on both windows
+- 🟡 yellow — either window ≥ 75%
 - 🔴 solid red — either window ≥ 100%, or Anthropic reports you're actively
   rate-limited/exceeded
 - 🟡 blinking (1s on / 1s off) — offline / no data / can't reach the proxy
