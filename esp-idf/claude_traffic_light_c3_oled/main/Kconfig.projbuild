@@ -1,0 +1,22 @@
+menu "Example Configuration"
+
+    config EXAMPLE_WIFI_SSID
+        string "WiFi SSID"
+        default "myssid"
+        help
+            SSID (network name) to connect to.
+
+    config EXAMPLE_WIFI_PASSWORD
+        string "WiFi Password"
+        default "mypassword"
+        help
+            WiFi password (WPA or WPA2) to use.
+
+    config EXAMPLE_PROXY_URL
+        string "Claude traffic-light proxy /util URL"
+        default "http://192.168.1.50:8787/util"
+        help
+            Full URL (including port and path) of the claude-traffic-light-proxy
+            /util endpoint running on the PC.
+
+endmenu
