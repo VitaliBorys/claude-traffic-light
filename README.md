@@ -1,6 +1,6 @@
 # Claude Traffic Light
 
-A physical "traffic light" for Claude Code usage. `~/.claude/claude_usage_statusline.py`
+A physical "traffic light" for Claude Code usage. `statusline/claude_usage_statusline.py`
 is wired into Claude Code's `statusLine` hook: it reads the `rate_limits`
 Claude Code already has for the session and publishes them as retained JSON
 to a local MQTT broker (topic `claude/usage/state`) — no proxy, no token
@@ -21,15 +21,12 @@ showing percentage used and time until that window resets.
 
 ```
 claude-traffic-light-proxy.js      # legacy HTTP proxy (no dependencies, just Node's http/https) — not used by claude_traffic_light_c3_oled anymore, kept for reference/other uses
+statusline/
+  claude_usage_statusline.py       # Claude Code statusLine hook + MQTT publisher (source of truth for usage state)
 esp-idf/
   hw_test_c3_oled/                 # no-WiFi bring-up test: cycles LEDs + OLED
   claude_traffic_light_c3_oled/    # the real app: WiFi + MQTT + full display
 ```
-
-The statusline publisher itself (`claude_usage_statusline.py`) lives outside
-this repo, in `~/.claude/`, alongside the rest of your Claude Code config —
-see [Set up the usage-state source](#1-set-up-the-usage-state-source-mqtt)
-below.
 
 ## Hardware
 
@@ -66,15 +63,15 @@ If your traffic-light module is instead common-anode / active-low, flip
 
 ## 1. Set up the usage-state source (MQTT)
 
-Point Claude Code's statusline at `claude_usage_statusline.py`. In
-`~/.claude/settings.json` (`%USERPROFILE%\.claude\settings.json` on
-Windows):
+Point Claude Code's statusline at `statusline/claude_usage_statusline.py`
+from this repo. In `~/.claude/settings.json`
+(`%USERPROFILE%\.claude\settings.json` on Windows):
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "python C:/Users/YOURNAME/.claude/claude_usage_statusline.py",
+    "command": "python D:/path/to/ClaudeProxy/statusline/claude_usage_statusline.py",
     "refreshInterval": 15
   }
 }
@@ -95,6 +92,18 @@ to `claude/usage/state`:
 No proxy, no token handling — this data comes straight from Claude Code
 itself. You can sanity-check it's flowing with any MQTT client, e.g.
 `mosquitto_sub -h <broker-ip> -t claude/usage/state -v`.
+
+**Multiple concurrent Claude Code sessions:** every session's statusline
+publishes to the same shared, retained topic. Since each session only knows
+the `rate_limits` from its own last API response, without any coordination
+whichever session's 15s timer fires last would "win" — even with staler
+data. The script guards against this itself: before publishing, it reads
+back whatever's currently retained and only overwrites it if its own numbers
+are `>=` what's already there for the same reset window (usage only climbs
+until a reset), or if the window's `resets_at` has actually moved (a real
+reset happened, so the new snapshot is trusted unconditionally). No extra
+service or single-session restriction needed — see `should_publish()` in
+the script.
 
 ## 2. Flash the bring-up test (recommended first)
 
