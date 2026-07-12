@@ -63,15 +63,23 @@ If your traffic-light module is instead common-anode / active-low, flip
 
 ## 1. Set up the usage-state source (MQTT)
 
-Point Claude Code's statusline at `statusline/claude_usage_statusline.py`
-from this repo. In `~/.claude/settings.json`
+`statusline/claude_usage_statusline.py` in this repo is the
+version-controlled source; Claude Code actually runs it from
+`~/.claude/claude_usage_statusline.py`, so copy it there (re-copy after any
+edit to either one):
+
+```
+cp statusline/claude_usage_statusline.py ~/.claude/claude_usage_statusline.py
+```
+
+Then point Claude Code's statusline at it. In `~/.claude/settings.json`
 (`%USERPROFILE%\.claude\settings.json` on Windows):
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "python D:/path/to/ClaudeProxy/statusline/claude_usage_statusline.py",
+    "command": "python C:/Users/YOURNAME/.claude/claude_usage_statusline.py",
     "refreshInterval": 15
   }
 }

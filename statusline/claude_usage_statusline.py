@@ -23,6 +23,10 @@ retained state if its own numbers are >= what's already there, unless a
 window boundary (resets_at) has actually moved, which means a real reset
 happened and the new snapshot is trusted unconditionally.
 
+Deploy: copy this file to ~/.claude/claude_usage_statusline.py (that's the
+path Claude Code actually runs — this repo copy is the version-controlled
+source; re-copy after editing either one).
+
 Install once:
     pip install paho-mqtt
 
@@ -30,7 +34,7 @@ Wire into ~/.claude/settings.json (Windows: %USERPROFILE%\\.claude\\settings.jso
     {
       "statusLine": {
         "type": "command",
-        "command": "python D:/learn/ClaudeProxy/statusline/claude_usage_statusline.py",
+        "command": "python C:/Users/YOURNAME/.claude/claude_usage_statusline.py",
         "refreshInterval": 15
       }
     }
