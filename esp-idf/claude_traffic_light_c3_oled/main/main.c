@@ -48,7 +48,7 @@ static const char *TAG = "traffic_light";
 #define ACTIVE_HIGH true // common cathode module
 #define WIFI_LED_ACTIVE_HIGH false // onboard LED; flip to true if it lights the wrong way
 
-#define STALE_MS       60000 // no MQTT message this long (publisher polls every 15s) -> OFFLINE
+#define STALE_MS       1800000 // no MQTT message this long -> OFFLINE (generous: survives gaps between sessions)
 #define ERROR_BLINK_MS 1000   // OFFLINE (errors/connection) blink period: 1s on / 1s off
 #define DISPLAY_MS     30000  // OLED page swap period (5h <-> 7d)
 // --------------------------------------------

@@ -12,7 +12,7 @@ your 5-hour and 7-day usage limits.
 - 🟡 yellow — either window ≥ 75%
 - 🔴 solid red — either window ≥ 100%
 - 🟡 blinking (1s on / 1s off) — offline / no data / broker unreachable / no
-  message received in the last 60s
+  message received in the last 30 minutes
 
 The OLED cycles every 30 seconds between the 5h view and the 7d view, each
 showing percentage used and time until that window resets.
@@ -161,6 +161,8 @@ never committed to source.
   the firmware derives "now" from each message's `ts` field plus elapsed
   device uptime since it arrived — no SNTP/RTC needed.
 - `MODE_OFFLINE` (no data / broker unreachable / stale) blinks yellow 1s
-  on/1s off — triggered if no MQTT message arrives for 60s. A dead solid
-  state — no blink at all — usually means the OLED/I2C wiring itself is the
-  problem, not WiFi/MQTT connectivity.
+  on/1s off — triggered if no MQTT message arrives for 30 minutes (retained
+  messages don't expire, so the last known state survives brief gaps
+  between Claude Code sessions rather than immediately going dark). A dead
+  solid state — no blink at all — usually means the OLED/I2C wiring itself
+  is the problem, not WiFi/MQTT connectivity.
