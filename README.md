@@ -6,8 +6,8 @@ Anthropic sends back, and serves them as JSON. An ESP32-C3 board polls that
 JSON over WiFi and drives 3 LEDs + a tiny OLED to show how close you are to
 your 5-hour and 7-day usage limits.
 
-- 🟢 green — under 80% on both windows
-- 🟡 yellow — either window ≥ 80%
+- 🟢 green — under 75% on both windows
+- 🟡 yellow — either window ≥ 75%
 - 🔴 solid red — either window ≥ 100%, or Anthropic reports you're actively
   rate-limited/exceeded
 - 🟡 blinking (1s on / 1s off) — offline / no data / can't reach the proxy
@@ -40,8 +40,9 @@ already wired to the board, not a separate module), plus an external
 | Traffic light GREEN  | GPIO10       | wire to the module's green input    |
 | Traffic light GND    | any GND pin  | common ground with the ESP32-C3     |
 
-GPIO8 (onboard status LED) and GPIO9 (BOOT button) are already in use by
-the board itself — left alone.
+GPIO8 (onboard status LED) doubles as a WiFi indicator: blinking while
+(re)connecting, solid once associated. GPIO9 (BOOT button) is already in
+use by the board itself — left alone.
 
 If your traffic-light module is instead common-anode / active-low, flip
 `ACTIVE_HIGH` to `false` near the top of `main.c` in both projects.

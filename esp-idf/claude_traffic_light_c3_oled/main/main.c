@@ -6,7 +6,8 @@
  *
  * Board: "ESP32-C3 0.42 OLED" (ABRobot / 01Space style).
  *   OLED over I2C: SDA=GPIO5, SCL=GPIO6, SSD1306 72x40, addr 0x3C.
- *   GPIO8 (onboard LED) and GPIO9 (BOOT) are also in use — left alone.
+ *   GPIO8 (onboard LED) doubles as a WiFi indicator (blink=connecting,
+ *   solid=connected). GPIO9 (BOOT) is also in use — left alone.
  *
  * Configure WiFi SSID/password and the proxy URL via `idf.py menuconfig`
  * under "Example Configuration".
@@ -35,12 +36,14 @@ static const char *TAG = "traffic_light";
 #define WIFI_PASS     CONFIG_EXAMPLE_WIFI_PASSWORD
 #define PROXY_URL     CONFIG_EXAMPLE_PROXY_URL
 
-// Free pins (not used by OLED 5/6, onboard LED 8, BOOT 9)
+// Free pins (not used by OLED 5/6, BOOT 9)
 #define PIN_RED    3
 #define PIN_YELLOW 4
 #define PIN_GREEN  10
+#define PIN_WIFI_LED 8 // onboard status LED: blinks while connecting, solid once associated
 
 #define ACTIVE_HIGH true // common cathode module
+#define WIFI_LED_ACTIVE_HIGH false // onboard LED; flip to true if it lights the wrong way
 
 #define POLL_MS        20000 // proxy poll period
 #define ERROR_BLINK_MS 1000   // OFFLINE (errors/connection) blink period: 1s on / 1s off
@@ -51,7 +54,7 @@ static const char *TAG = "traffic_light";
 #define I2C_SDA_IO 5
 #define I2C_SCL_IO 6
 #define I2C_DISPLAY_ADDRESS 0x3C
-#define I2C_FREQ_HZ 400000
+#define I2C_FREQ_HZ 100000 // extra noise margin; bus corruption was traced to LED wiring/grounding, not clock speed
 #define I2C_TIMEOUT_MS 1000
 
 static i2c_master_bus_handle_t i2c_bus_handle = NULL;
@@ -72,6 +75,25 @@ static bool show_weekly = false;    // OLED page: false=5h, true=7d
 
 // ---------------- WiFi ----------------
 static volatile bool wifi_connected = false;
+static int64_t wifi_led_last_toggle = 0;
+static bool wifi_led_blink_on = false;
+#define WIFI_LED_BLINK_MS 300 // half-period -> ~600ms full blink cycle while (re)connecting
+
+// Blinks the onboard LED while disconnected, holds it solid once associated.
+// Safe to call from both the blocking connect wait and the main loop.
+static void service_wifi_led(void)
+{
+    if (wifi_connected) {
+        gpio_set_level(PIN_WIFI_LED, WIFI_LED_ACTIVE_HIGH ? 1 : 0);
+        return;
+    }
+    int64_t now = esp_timer_get_time() / 1000;
+    if (now - wifi_led_last_toggle >= WIFI_LED_BLINK_MS) {
+        wifi_led_blink_on = !wifi_led_blink_on;
+        wifi_led_last_toggle = now;
+    }
+    gpio_set_level(PIN_WIFI_LED, (wifi_led_blink_on == WIFI_LED_ACTIVE_HIGH) ? 1 : 0);
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -107,6 +129,9 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    // Disable modem sleep: periodic radio wake for beacons otherwise seems to
+    // glitch the I2C bus to the OLED (SDA/SCL run right next to the antenna).
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 }
 
 // Waits up to timeout_ms for a WiFi connection (mirrors original 15s wait).
@@ -114,8 +139,10 @@ static void connect_wifi(int timeout_ms)
 {
     int64_t t0 = esp_timer_get_time();
     while (!wifi_connected && (esp_timer_get_time() - t0) / 1000 < timeout_ms) {
-        vTaskDelay(pdMS_TO_TICKS(300));
+        service_wifi_led();
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
+    service_wifi_led();
 }
 
 // ---------------- OLED (U8g2 over new i2c_master driver) ----------------
@@ -204,7 +231,7 @@ static void init_display(void)
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &i2c_bus_handle));
 
-    u8g2_Setup_ssd1306_i2c_72x40_er_f(&u8g2, U8G2_R0, u8x8_byte_i2c_cb, u8x8_gpio_delay_cb);
+    u8g2_Setup_ssd1306_i2c_72x40_er_f(&u8g2, U8G2_R2, u8x8_byte_i2c_cb, u8x8_gpio_delay_cb); // R2 = rotated 180deg
     u8g2_InitDisplay(&u8g2);
     u8g2_SetPowerSave(&u8g2, 0);
     u8g2_SetContrast(&u8g2, 255);
@@ -221,7 +248,7 @@ static void set_lights(bool r, bool y, bool g)
 
 static void init_leds(void)
 {
-    uint64_t mask = (1ULL << PIN_RED) | (1ULL << PIN_YELLOW) | (1ULL << PIN_GREEN);
+    uint64_t mask = (1ULL << PIN_RED) | (1ULL << PIN_YELLOW) | (1ULL << PIN_GREEN) | (1ULL << PIN_WIFI_LED);
     gpio_config_t io_conf = {
         .pin_bit_mask = mask,
         .mode = GPIO_MODE_OUTPUT,
@@ -344,7 +371,7 @@ static void poll_proxy(void)
             reset7d = okr7 ? (int)r7 : -1;
             blocked = is_blocked;
             if (blocked || u >= 1.0f || util7d >= 1.0f)   mode = MODE_RED; // solid red for both
-            else if (u >= 0.80f || util7d >= 0.80f)        mode = MODE_YELLOW;
+            else if (u >= 0.75f || util7d >= 0.75f)        mode = MODE_YELLOW;
             else                                           mode = MODE_GREEN;
         }
         ESP_LOGI(TAG, "util_5h=%.2f util_7d=%.2f reset5h=%ds reset7d=%ds -> mode=%d",
@@ -398,6 +425,7 @@ void app_main(void)
             last_display_switch = now;
             if (online) draw_screen();
         }
+        service_wifi_led();
         render();
         vTaskDelay(pdMS_TO_TICKS(10));
     }
