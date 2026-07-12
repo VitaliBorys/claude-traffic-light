@@ -12,11 +12,18 @@ menu "Example Configuration"
         help
             WiFi password (WPA or WPA2) to use.
 
-    config EXAMPLE_PROXY_URL
-        string "Claude traffic-light proxy /util URL"
-        default "http://192.168.1.50:8787/util"
+    config EXAMPLE_MQTT_BROKER_URI
+        string "MQTT broker URI"
+        default "mqtt://192.168.1.50:1883"
         help
-            Full URL (including port and path) of the claude-traffic-light-proxy
-            /util endpoint running on the PC.
+            URI of the local MQTT broker that claude_usage_statusline.py
+            publishes usage state to (see ~/.claude/claude_usage_statusline.py).
+
+    config EXAMPLE_MQTT_TOPIC
+        string "MQTT usage-state topic"
+        default "claude/usage/state"
+        help
+            Retained topic the statusline publisher writes usage-state
+            JSON to.
 
 endmenu

@@ -1,16 +1,18 @@
-/* Claude Traffic Light — ESP32-C3 + 0.42" OLED (ESP-IDF port, final version)
+/* Claude Traffic Light — ESP32-C3 + 0.42" OLED (ESP-IDF port, MQTT version)
  * ------------------------------------------------------------
- * Polls the local proxy (GET /util), drives the traffic-light module
- * (common cathode, 3 signals + GND) and shows the 5h-window percentage
- * and countdown-to-reset on the built-in OLED.
+ * Subscribes to a retained MQTT topic (published by
+ * ~/.claude/claude_usage_statusline.py via Claude Code's statusLine hook)
+ * carrying the current 5h/7d/daily usage state, drives the traffic-light
+ * module (common cathode, 3 signals + GND) and shows the 5h-window
+ * percentage and countdown-to-reset on the built-in OLED.
  *
  * Board: "ESP32-C3 0.42 OLED" (ABRobot / 01Space style).
  *   OLED over I2C: SDA=GPIO5, SCL=GPIO6, SSD1306 72x40, addr 0x3C.
  *   GPIO8 (onboard LED) doubles as a WiFi indicator (blink=connecting,
  *   solid=connected). GPIO9 (BOOT) is also in use — left alone.
  *
- * Configure WiFi SSID/password and the proxy URL via `idf.py menuconfig`
- * under "Example Configuration".
+ * Configure WiFi SSID/password and the MQTT broker URI/topic via
+ * `idf.py menuconfig` under "Example Configuration".
  * ------------------------------------------------------------
  */
 
@@ -26,15 +28,16 @@
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
-#include "esp_http_client.h"
+#include "mqtt_client.h"
 #include "u8g2.h"
 
 static const char *TAG = "traffic_light";
 
 // ---------------- SETTINGS ----------------
-#define WIFI_SSID     CONFIG_EXAMPLE_WIFI_SSID
-#define WIFI_PASS     CONFIG_EXAMPLE_WIFI_PASSWORD
-#define PROXY_URL     CONFIG_EXAMPLE_PROXY_URL
+#define WIFI_SSID        CONFIG_EXAMPLE_WIFI_SSID
+#define WIFI_PASS        CONFIG_EXAMPLE_WIFI_PASSWORD
+#define MQTT_BROKER_URI  CONFIG_EXAMPLE_MQTT_BROKER_URI
+#define MQTT_TOPIC       CONFIG_EXAMPLE_MQTT_TOPIC
 
 // Free pins (not used by OLED 5/6, BOOT 9)
 #define PIN_RED    3
@@ -45,7 +48,7 @@ static const char *TAG = "traffic_light";
 #define ACTIVE_HIGH true // common cathode module
 #define WIFI_LED_ACTIVE_HIGH false // onboard LED; flip to true if it lights the wrong way
 
-#define POLL_MS        20000 // proxy poll period
+#define STALE_MS       60000 // no MQTT message this long (publisher polls every 15s) -> OFFLINE
 #define ERROR_BLINK_MS 1000   // OFFLINE (errors/connection) blink period: 1s on / 1s off
 #define DISPLAY_MS     30000  // OLED page swap period (5h <-> 7d)
 // --------------------------------------------
@@ -63,12 +66,18 @@ static i2c_master_dev_handle_t display_dev_handle = NULL;
 typedef enum { MODE_GREEN, MODE_YELLOW, MODE_RED, MODE_OFFLINE } light_mode_t;
 static light_mode_t mode = MODE_OFFLINE;
 
+// Usage state, written from the MQTT event task, read from the main task.
+// Left lock-free on purpose: every field is word-sized (float/bool/int64),
+// so a read never sees a torn value — at worst one redraw mixes an old and
+// a new field, which self-corrects on the next message a few seconds later.
 static float util5h = 0;   // 0..1
 static float util7d = 0;   // 0..1
 static int   reset5h = -1; // seconds until reset, -1 = unknown
 static int   reset7d = -1; // seconds until reset, -1 = unknown
 static bool  online = false;
-static bool  blocked = false; // true = proxy reports rate_limited/exceeded (shows "LIMIT")
+static bool  blocked = false; // true = either window at/over 100% (shows "LIMIT")
+static volatile int64_t last_msg_ms = -1;
+static volatile bool data_dirty = false;
 
 static bool error_blink_on = false; // OFFLINE cadence
 static bool show_weekly = false;    // OLED page: false=5h, true=7d
@@ -262,7 +271,7 @@ static void init_leds(void)
 
 // ---------------- Tiny hand-rolled JSON field extraction ----------------
 // Mirrors the original Arduino jsonNumber()/jsonHas() helpers: no library,
-// just enough to pull a handful of known fields out of a flat JSON object.
+// just enough to pull a handful of known fields out of a small JSON object.
 static float json_number(const char *s, const char *key, bool *ok)
 {
     char pat[40];
@@ -275,30 +284,146 @@ static float json_number(const char *s, const char *key, bool *ok)
     *ok = true;
     return strtof(p, NULL);
 }
-static bool json_has(const char *s, const char *key, const char *value)
+
+// Copies the flat sub-object under "key":{ ... } into out (no nested braces
+// expected inside — true for the five_hour/seven_day/daily objects below).
+static bool find_object(const char *s, const char *key, char *out, size_t out_size)
 {
-    char pat[64];
-    snprintf(pat, sizeof(pat), "\"%s\":\"%s\"", key, value);
-    return strstr(s, pat) != NULL;
+    char pat[32];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(s, pat);
+    if (!p) return false;
+    p += strlen(pat);
+    while (*p == ' ') p++;
+    if (*p != '{') return false;
+    const char *start = p + 1;
+    const char *end = strchr(start, '}');
+    if (!end) return false;
+    size_t len = (size_t)(end - start);
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return true;
 }
 
-// ---------------- HTTP poll ----------------
-#define HTTP_BUF_SIZE 512
-typedef struct { char buf[HTTP_BUF_SIZE]; int len; } http_resp_t;
+// ---------------- MQTT usage-state payload ----------------
+// Payload shape, published by ~/.claude/claude_usage_statusline.py:
+//   {"five_hour": {"used_pct": 31, "resets_at": 1783893600},
+//    "seven_day": {"used_pct": 17, "resets_at": 1784152800},
+//    "daily":     {"used_pct": 5.0},
+//    "ts": 1783890405}
+// used_pct is 0..100; resets_at/ts are Unix seconds (may be null before the
+// first real API response, or right after a window reset).
 
-static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+// Estimate of "now" (Unix seconds), derived from the last message's "ts"
+// plus elapsed device uptime since it arrived — avoids needing SNTP just to
+// turn an absolute resets_at into a countdown.
+static int64_t server_ts_ref = -1;
+static int64_t server_ts_recv_ms = 0;
+
+static int64_t estimated_now(void)
 {
-    http_resp_t *r = (http_resp_t *)evt->user_data;
-    if (evt->event_id == HTTP_EVENT_ON_DATA) {
-        int room = HTTP_BUF_SIZE - 1 - r->len;
-        int n = evt->data_len < room ? evt->data_len : room;
-        if (n > 0) {
-            memcpy(r->buf + r->len, evt->data, n);
-            r->len += n;
-            r->buf[r->len] = '\0';
-        }
+    if (server_ts_ref < 0) return -1;
+    int64_t elapsed_s = (esp_timer_get_time() / 1000 - server_ts_recv_ms) / 1000;
+    return server_ts_ref + elapsed_s;
+}
+
+static void handle_usage_json(const char *s)
+{
+    char sub[80];
+    bool ok, okts;
+
+    float ts = json_number(s, "ts", &okts);
+    if (okts) {
+        server_ts_ref = (int64_t)ts;
+        server_ts_recv_ms = esp_timer_get_time() / 1000;
     }
-    return ESP_OK;
+    int64_t now = estimated_now();
+
+    bool have5 = false, have7 = false;
+    float u5 = 0, u7 = 0;
+    int64_t resets_at_5h = -1, resets_at_7d = -1;
+
+    if (find_object(s, "five_hour", sub, sizeof(sub))) {
+        float v = json_number(sub, "used_pct", &ok);
+        if (ok) { u5 = v / 100.0f; have5 = true; }
+        float r = json_number(sub, "resets_at", &ok);
+        if (ok) resets_at_5h = (int64_t)r;
+    }
+    if (find_object(s, "seven_day", sub, sizeof(sub))) {
+        float v = json_number(sub, "used_pct", &ok);
+        if (ok) { u7 = v / 100.0f; have7 = true; }
+        float r = json_number(sub, "resets_at", &ok);
+        if (ok) resets_at_7d = (int64_t)r;
+    }
+
+    if (!have5 && !have7) {
+        return; // nothing usable in this message; leave prior state alone
+    }
+
+    util5h = have5 ? u5 : util5h;
+    util7d = have7 ? u7 : util7d;
+    reset5h = (resets_at_5h >= 0 && now >= 0) ? (int)(resets_at_5h - now) : -1;
+    reset7d = (resets_at_7d >= 0 && now >= 0) ? (int)(resets_at_7d - now) : -1;
+    blocked = (util5h >= 1.0f || util7d >= 1.0f);
+    online = true;
+    last_msg_ms = esp_timer_get_time() / 1000;
+
+    if (blocked)                                mode = MODE_RED;
+    else if (util5h >= 0.75f || util7d >= 0.75f) mode = MODE_YELLOW;
+    else                                         mode = MODE_GREEN;
+
+    ESP_LOGI(TAG, "util_5h=%.2f util_7d=%.2f reset5h=%ds reset7d=%ds -> mode=%d",
+             util5h, util7d, reset5h, reset7d, mode);
+
+    data_dirty = true;
+}
+
+// ---------------- MQTT client ----------------
+static char mqtt_buf[512];
+static int mqtt_buf_len = 0;
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT connected, subscribing to %s", MQTT_TOPIC);
+        esp_mqtt_client_subscribe(event->client, MQTT_TOPIC, 1);
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG, "MQTT disconnected");
+        break;
+    case MQTT_EVENT_DATA: {
+        if (event->current_data_offset == 0) mqtt_buf_len = 0;
+        int room = (int)sizeof(mqtt_buf) - 1 - mqtt_buf_len;
+        int n = event->data_len < room ? event->data_len : room;
+        if (n > 0) {
+            memcpy(mqtt_buf + mqtt_buf_len, event->data, n);
+            mqtt_buf_len += n;
+            mqtt_buf[mqtt_buf_len] = '\0';
+        }
+        if (event->current_data_offset + event->data_len >= event->total_data_len) {
+            handle_usage_json(mqtt_buf);
+        }
+        break;
+    }
+    case MQTT_EVENT_ERROR:
+        ESP_LOGW(TAG, "MQTT error, type=%d", event->error_handle->error_type);
+        break;
+    default:
+        break;
+    }
+}
+
+static void mqtt_start(void)
+{
+    esp_mqtt_client_config_t cfg = {
+        .broker.address.uri = MQTT_BROKER_URI,
+    };
+    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&cfg);
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(client);
 }
 
 static void draw_screen(void)
@@ -335,56 +460,6 @@ static void draw_screen(void)
     u8g2_SendBuffer(&u8g2);
 }
 
-static void poll_proxy(void)
-{
-    if (!wifi_connected) connect_wifi(15000);
-
-    http_resp_t resp = { .len = 0 };
-    resp.buf[0] = '\0';
-
-    esp_http_client_config_t config = {
-        .url = PROXY_URL,
-        .timeout_ms = 4000,
-        .event_handler = http_event_handler,
-        .user_data = &resp,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    esp_err_t err = esp_http_client_perform(client);
-
-    if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
-        bool ok, okr, ok7, okr7;
-        float u = json_number(resp.buf, "util_5h", &ok);
-        float r = json_number(resp.buf, "reset_in_5h", &okr);
-        float u7 = json_number(resp.buf, "util_7d", &ok7);
-        float r7 = json_number(resp.buf, "reset_in_7d", &okr7);
-        bool is_blocked = json_has(resp.buf, "status_5h", "rate_limited") ||
-                          json_has(resp.buf, "status_5h", "exceeded") ||
-                          json_has(resp.buf, "status_7d", "rate_limited") ||
-                          json_has(resp.buf, "status_7d", "exceeded");
-        if (!ok) {
-            online = false; mode = MODE_OFFLINE; // no data yet
-        } else {
-            online = true;
-            util5h = u;
-            util7d = ok7 ? u7 : 0;
-            reset5h = okr ? (int)r : -1;
-            reset7d = okr7 ? (int)r7 : -1;
-            blocked = is_blocked;
-            if (blocked || u >= 1.0f || util7d >= 1.0f)   mode = MODE_RED; // solid red for both
-            else if (u >= 0.75f || util7d >= 0.75f)        mode = MODE_YELLOW;
-            else                                           mode = MODE_GREEN;
-        }
-        ESP_LOGI(TAG, "util_5h=%.2f util_7d=%.2f reset5h=%ds reset7d=%ds -> mode=%d",
-                 online ? util5h : -1, online ? util7d : -1, reset5h, reset7d, mode);
-    } else {
-        online = false; mode = MODE_OFFLINE;
-        ESP_LOGW(TAG, "HTTP err=%d status=%d (proxy unreachable)", err,
-                 err == ESP_OK ? esp_http_client_get_status_code(client) : -1);
-    }
-    esp_http_client_cleanup(client);
-    draw_screen();
-}
-
 static void render(void)
 {
     switch (mode) {
@@ -410,21 +485,27 @@ void app_main(void)
 
     wifi_init_sta();
     connect_wifi(15000);
-    poll_proxy();
+    mqtt_start();
 
-    int64_t last_poll = esp_timer_get_time() / 1000;
-    int64_t last_error_blink = last_poll;
-    int64_t last_display_switch = last_poll;
+    int64_t last_error_blink = esp_timer_get_time() / 1000;
+    int64_t last_display_switch = last_error_blink;
 
     while (1) {
         int64_t now = esp_timer_get_time() / 1000;
-        if (now - last_poll >= POLL_MS) { poll_proxy(); last_poll = now; }
+
+        if (online && last_msg_ms >= 0 && (now - last_msg_ms) > STALE_MS) {
+            online = false;
+            mode = MODE_OFFLINE;
+            data_dirty = true;
+        }
         if (now - last_error_blink >= ERROR_BLINK_MS) { error_blink_on = !error_blink_on; last_error_blink = now; }
         if (now - last_display_switch >= DISPLAY_MS) {
             show_weekly = !show_weekly;
             last_display_switch = now;
-            if (online) draw_screen();
+            if (online) data_dirty = true;
         }
+        if (data_dirty) { data_dirty = false; draw_screen(); }
+
         service_wifi_led();
         render();
         vTaskDelay(pdMS_TO_TICKS(10));
