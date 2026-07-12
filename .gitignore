@@ -8,6 +8,10 @@
 node_modules/
 *.log
 
+# Python
+__pycache__/
+*.pyc
+
 # OS/editor
 .vscode/
 Thumbs.db
